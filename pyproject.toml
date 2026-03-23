@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextpack"
+version = "1.0.0"
+description = "CLI de sauvegarde de contexte IA — Reprends n'importe quel projet après expiration du contexte"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+keywords = ["ai", "context", "llm", "cli", "pdf", "markdown"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "reportlab>=4.0.0",
+    "pathspec>=0.11.0",
+    "tiktoken>=0.5.0",
+    "anthropic>=0.25.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+contextpack = "contextpack.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["contextpack*"]
