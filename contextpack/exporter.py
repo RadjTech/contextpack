@@ -263,25 +263,35 @@ def export_pdf(
     # ── Comptage réel des pages via dry-run ReportLab ──
     def count_pages_dry_run(story_elements) -> int:
         """
-        Lance un build ReportLab sur BytesIO pour obtenir le vrai nombre de pages.
-        Beaucoup plus fiable que toute heuristique sur les lignes.
+        Mesure le vrai nombre de pages en buildant dans un fichier temporaire.
+        On utilise un fichier tmp (pas BytesIO) car certaines versions de ReportLab
+        ont besoin d'un vrai fichier seekable pour écrire correctement.
         """
-        import io
+        import tempfile, os
         from reportlab.platypus import SimpleDocTemplate
         from reportlab.lib.units import cm
 
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(
-            buf, pagesize=A4,
-            leftMargin=1.5 * cm, rightMargin=1.5 * cm,
-            topMargin=1.8 * cm, bottomMargin=1.8 * cm,
-        )
         page_count = [0]
 
         def count_page(canvas, doc):
             page_count[0] = doc.page
 
-        doc.build(story_elements, onFirstPage=count_page, onLaterPages=count_page)
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            doc = SimpleDocTemplate(
+                tmp_path, pagesize=A4,
+                leftMargin=1.5 * cm, rightMargin=1.5 * cm,
+                topMargin=1.8 * cm, bottomMargin=1.8 * cm,
+            )
+            doc.build(story_elements, onFirstPage=count_page, onLaterPages=count_page)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
         return page_count[0]
 
     generated_paths = []
@@ -301,84 +311,79 @@ def export_pdf(
         generated_paths.append(out_path)
 
     else:
-        # ── Mode multi-volumes — splitting basé sur le vrai comptage de pages ──
+        # ── Mode multi-volumes : découpage incrémental avec dry-run volume entier ──
         #
-        # Stratégie :
-        #   1. Mesurer en dry-run les pages fixes (couverture + TOC vide + résumé)
-        #   2. Pour chaque fichier, mesurer en dry-run son bloc seul
-        #   3. Grouper les fichiers en volumes en respectant max_pages_per_pack
+        # On ajoute les fichiers un par un dans le volume courant.
+        # Après chaque ajout on mesure le volume COMPLET en dry-run.
+        # Dès que ça dépasse max_pages_per_pack → on ferme le volume et on repart.
+        # C'est la seule approche exacte : on ne peut pas sommer des pages isolées
+        # car ReportLab reflow les éléments ensemble (PageBreak, Preformatted, etc.)
         #
         from rich.console import Console as RConsole
         rc = RConsole()
 
-        rc.print("[dim]🔍 Mesure des pages réelles (dry-run)...[/dim]")
+        rc.print(f"[dim]🔍 Calcul du découpage (max {max_pages_per_pack} pages/volume)...[/dim]")
 
-        # Pages fixes du volume 1 (couverture + TOC + résumé)
-        dummy_cover_toc_summary = (
-            build_cover(st) +
-            build_toc(st, files) +   # TOC complet pour être conservateur
-            build_summary_section(st)
-        )
-        fixed_pages_vol1 = count_pages_dry_run(dummy_cover_toc_summary)
+        def build_volume_story(vol_files, is_first_vol: bool) -> list:
+            s = []
+            s += build_cover(st, part_info="Volume X")  # placeholder = mêmes pages
+            s += build_toc(st, vol_files)
+            if is_first_vol:
+                s += build_summary_section(st)
+            for f in vol_files:
+                s += build_file_block(st, f)
+            return s
 
-        # Pages fixes des volumes suivants (couverture + TOC seul, pas de résumé)
-        dummy_cover_toc = build_cover(st) + build_toc(st, [files[0]] if files else [])
-        fixed_pages_other = count_pages_dry_run(dummy_cover_toc)
+        volumes: List[List[Dict]] = []
+        current_vol: List[Dict] = []
 
-        rc.print(f"[dim]  Pages fixes vol.1 : {fixed_pages_vol1}  |  autres volumes : {fixed_pages_other}[/dim]")
+        for f in files:
+            candidate = current_vol + [f]
+            is_first = len(volumes) == 0
+            pages = count_pages_dry_run(build_volume_story(candidate, is_first))
+            rc.print(f"[dim]  + {f['rel_path']} → volume courant = {pages} pages[/dim]")
 
-        # Mesurer les pages de chaque fichier individuellement
-        file_pages: List[int] = []
-        for i, f in enumerate(files):
-            block = build_file_block(st, f)
-            pages = count_pages_dry_run(block)
-            file_pages.append(pages)
-            rc.print(f"[dim]  {f['rel_path']} → {pages} page(s)[/dim]")
-
-        # Grouper en volumes
-        volumes: List[List[int]] = []   # liste d'indices de fichiers par volume
-        current_indices: List[int] = []
-        current_pages = fixed_pages_vol1  # volume 1 commence avec les pages fixes vol1
-
-        for i, fp in enumerate(file_pages):
-            fixed = fixed_pages_vol1 if not volumes else fixed_pages_other
-            if current_pages + fp > max_pages_per_pack and current_indices:
-                volumes.append(current_indices)
-                current_indices = [i]
-                current_pages = fixed_pages_other + fp
+            if pages > max_pages_per_pack and current_vol:
+                # Ce fichier fait déborder → fermer le volume courant
+                volumes.append(current_vol)
+                current_vol = [f]
             else:
-                current_indices.append(i)
-                current_pages += fp
+                current_vol = candidate
 
-        if current_indices:
-            volumes.append(current_indices)
+        if current_vol:
+            volumes.append(current_vol)
 
         total_parts = len(volumes)
-        rc.print(f"[cyan]📦 {total_parts} volume(s) prévu(s)[/cyan]")
+        rc.print(f"[cyan]📦 {total_parts} volume(s)[/cyan]")
 
-        for part_idx, indices in enumerate(volumes, 1):
-            vol_files = [files[i] for i in indices]
+        for part_idx, vol_files in enumerate(volumes, 1):
+            is_first = part_idx == 1
             part_label = f"Volume {part_idx}/{total_parts}"
 
-            story = []
-            story += build_cover(st, part_info=part_label)
-            story += build_toc(st, vol_files)
-            if part_idx == 1:
-                story += build_summary_section(st)
-            for f in vol_files:
-                story += build_file_block(st, f)
+            def make_story(label=part_label, first=is_first, vf=vol_files):
+                """Reconstruit un story frais — les Flowables ReportLab sont stateful."""
+                s = []
+                s += build_cover(st, part_info=label)
+                s += build_toc(st, vf)
+                if first:
+                    s += build_summary_section(st)
+                for f in vf:
+                    s += build_file_block(st, f)
+                return s
+
+            # Dry-run pour afficher le compte de pages (story frais)
+            vol_pages = count_pages_dry_run(make_story())
 
             suffix = f"_part{part_idx}" if total_parts > 1 else ""
             out_path = out_dir / f"{project_name}_context_{timestamp}{suffix}.pdf"
 
-            # Compter les pages avant le build final (dry-run sur le vrai story du volume)
-            vol_pages = count_pages_dry_run(story)
-
+            # Build final avec un story neuf (jamais réutiliser un story après build)
             _build_pdf(
-                story, out_path, project_name,
+                make_story(),
+                out_path, project_name,
                 on_page_factory(project_name, part_label if total_parts > 1 else ""),
             )
-            rc.print(f"[green]✅ {out_path.name}[/green] [dim]({vol_pages} pages)[/dim]")
+            rc.print(f"[green]  ✅ {out_path.name}[/green] [dim]→ {vol_pages} pages[/dim]")
             generated_paths.append(out_path)
 
     return generated_paths
